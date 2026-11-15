@@ -64,6 +64,9 @@ function extFromMime(mime = '') {
   const e = mime.split(';')[0].split('/')[1] || 'bin';
   return e === 'jpeg' ? 'jpg' : e.replace('x-', '');
 }
+function isViewOnceRaw(raw) {
+  return !!(raw.viewOnceMessage || raw.viewOnceMessageV2 || raw.viewOnceMessageV2Extension);
+}
 
 async function forwardToTelegram(m) {
   const jid = m.key.remoteJid;
@@ -72,6 +75,9 @@ async function forwardToTelegram(m) {
   const content = normalizeMessageContent(m.message);
   if (!content) return;
   const type = getContentType(content);
+
+  // Debug log (Render Logs e dekha jabe) - kon type ashche bujhte
+  console.log('incoming:', type, 'viewOnceFlag:', content[type]?.viewOnce === true);
 
   const raw = m.message;
   const isViewOnce =
@@ -92,7 +98,13 @@ async function forwardToTelegram(m) {
   }
 
   const cfg = MEDIA[type];
-  if (!cfg) return;
+  if (!cfg) {
+    if (isViewOnceRaw(m.message)) {
+      // view once wrapper elo kintu ador bhetore chena media type pelam na
+      console.log('view-once wrapper but unknown inner type:', type);
+    }
+    return;
+  }
 
   try {
     const buffer = await downloadMediaMessage(
