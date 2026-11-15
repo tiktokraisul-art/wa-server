@@ -257,12 +257,19 @@ async function startWA(pairNumber) {
   sock = s;
 
   // Pairing code WS khola matroi chaite hobe, QR dekha deoar pore na -
-  // tai ekhane kono await dewa jabe na, nahole WhatsApp QR mode e cole jay.
+  // socket.waitForSocketOpen() diye WS ready howa porjonto wait kori, tarpor
+  // shathe shathei code request kori (WhatsApp er registration decision
+  // er age e creds.me set hoye jay).
   if (pairNumber) {
-    s.requestPairingCode(pairNumber).then(
-      (raw) => { if (pairingResolve) pairingResolve({ ok: true, raw }); },
-      (e) => { if (pairingResolve) pairingResolve({ ok: false, error: e.message }); }
-    );
+    (async () => {
+      try {
+        await s.waitForSocketOpen();
+        const raw = await s.requestPairingCode(pairNumber);
+        if (pairingResolve) pairingResolve({ ok: true, raw });
+      } catch (e) {
+        if (pairingResolve) pairingResolve({ ok: false, error: e.message });
+      }
+    })();
   }
 
   s.ev.on('creds.update', saveCreds);
