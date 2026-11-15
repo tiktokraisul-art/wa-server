@@ -116,6 +116,13 @@ async function saveTopicId(jid, threadId) {
     console.log('saveTopicId error:', e.message);
   }
 }
+// Shudhu existing topic khuje dekhe, notun banay na (presence update er jonno - message na ashle topic banano uchit na)
+async function getExistingTopicId(jid) {
+  if (topicCache.has(jid)) return topicCache.get(jid);
+  const id = await getTopicId(jid);
+  if (id) topicCache.set(jid, id);
+  return id;
+}
 async function getJidByThread(threadId) {
   if (threadToJid.has(threadId)) return threadToJid.get(threadId);
   if (!USE_DB) return null;
@@ -155,6 +162,18 @@ async function createForumTopic(name) {
   if (!j.ok) throw new Error(j.description || 'createForumTopic failed');
   return j.result.message_thread_id;
 }
+// Notun topic banar shomoy, shei contact/group er WhatsApp profile picture
+// (thakle) প্রথম মেসেজ হিসেবে ওই topic e pathiye dey, jate topic khulei bojha jay ke
+async function sendProfilePicToTopic(jid, threadId) {
+  try {
+    const url = await sock.profilePictureUrl(jid, 'image');
+    if (!url) return;
+    await tgJSON('sendPhoto', { chat_id: TG_CHAT, message_thread_id: threadId, photo: url });
+  } catch (e) {
+    // profile picture na thakle ba private thakle WhatsApp error dey - chup chap skip
+  }
+}
+
 async function getOrCreateTopic(jid, nameHint) {
   if (forumDisabled) return null;
   if (topicCache.has(jid)) return topicCache.get(jid);
@@ -162,10 +181,12 @@ async function getOrCreateTopic(jid, nameHint) {
 
   const task = (async () => {
     let id = await getTopicId(jid);
+    let isNew = false;
     if (!id) {
       try {
         id = await createForumTopic(nameHint || jid);
         await saveTopicId(jid, id);
+        isNew = true;
       } catch (e) {
         console.log('createForumTopic error:', e.message);
         if (/not enough rights|administrator|forum|supergroup/i.test(e.message)) {
@@ -179,6 +200,7 @@ async function getOrCreateTopic(jid, nameHint) {
       topicCache.set(jid, id);
       threadToJid.set(id, jid);
       await saveJidByThread(id, jid); // reply-to-WhatsApp er jonno reverse mapping o save kori
+      if (isNew) sendProfilePicToTopic(jid, id).catch(() => {});
     }
     return id;
   })();
@@ -204,6 +226,51 @@ async function getChatName(jid, pushName) {
     return name;
   }
   return pushName || `+${jid.split('@')[0]}`;
+}
+
+// ================= Online/Last seen tracking =================
+const subscribedPresence = new Set(); // jid - already subscribe kora hoyeche
+const lastPresence = new Map();       // jid -> 'available' | 'unavailable' (last pathano state)
+
+function fmtLastSeen(unixSeconds) {
+  if (!unixSeconds) return '';
+  const d = new Date(unixSeconds * 1000);
+  try {
+    return d.toLocaleString('en-GB', { timeZone: 'Asia/Dhaka', hour12: true });
+  } catch (e) {
+    return d.toISOString();
+  }
+}
+
+async function subscribePresence(jid) {
+  if (jid.endsWith('@g.us')) return; // group e presence subscribe kaj kore na
+  if (subscribedPresence.has(jid)) return;
+  subscribedPresence.add(jid);
+  try {
+    await sock.presenceSubscribe(jid);
+  } catch (e) {
+    console.log('presenceSubscribe error:', e.message);
+  }
+}
+
+async function handlePresenceUpdate(jid, presences) {
+  const p = presences?.[jid];
+  if (!p) return;
+  const state = p.lastKnownPresence; // 'available' | 'unavailable' | 'composing' | 'recording' | 'paused'
+  if (state !== 'available' && state !== 'unavailable') return; // typing/recording skip kori, spam na hoy
+
+  if (lastPresence.get(jid) === state) return; // age theke eki obostha, abar pathano dorkar nai
+  lastPresence.set(jid, state);
+
+  const threadId = await getExistingTopicId(jid);
+  if (!threadId) return; // ei contact er shathe kokhono message hoyni, topic nai
+
+  if (state === 'available') {
+    tg('sendMessage', { text: '🟢 Online', message_thread_id: threadId });
+  } else {
+    const seenText = p.lastSeen ? ` (last seen: ${fmtLastSeen(p.lastSeen)})` : '';
+    tg('sendMessage', { text: `⚪ Offline${seenText}`, message_thread_id: threadId });
+  }
 }
 
 // ================= Forward WhatsApp -> Telegram =================
@@ -279,6 +346,7 @@ async function forwardToTelegram(m) {
   const chatName = await getChatName(jid, m.pushName);
   const threadId = await getOrCreateTopic(jid, chatName);
   const threadField = threadId ? { message_thread_id: threadId } : {};
+  subscribePresence(jid).catch(() => {});
   const sayIn = (text) => tg('sendMessage', { text: String(text).slice(0, 4096), ...threadField });
 
   const mapKey = `${jid}:${m.key.id}`;
@@ -519,6 +587,11 @@ async function startWA(pairNumber) {
       if (!m.message || m.key.fromMe) continue;
       forwardToTelegram(m).catch((e) => console.log('forward error:', e.message));
     }
+  });
+
+  s.ev.on('presence.update', ({ id, presences }) => {
+    if (s !== sock) return;
+    handlePresenceUpdate(id, presences).catch((e) => console.log('presence handle error:', e.message));
   });
 }
 
