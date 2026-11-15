@@ -29,6 +29,10 @@ let registered = false; // age theke kono WhatsApp account pair kora ache kina
 let linking = false; // /qr ba /link ekta shomoy e ekbar e cholche
 let pairingResolve = null;
 const inbox = [];
+const topicCache = new Map();   // jid -> message_thread_id (ei process-e cache)
+const topicLocks = new Map();   // jid -> in-flight creation promise
+const groupNameCache = new Map();
+let forumDisabled = false;      // group e Topics chalu na thakle true hoye jabe
 
 process.on('unhandledRejection', (e) => console.log('unhandledRejection:', e?.message || e));
 process.on('uncaughtException', (e) => console.log('uncaughtException:', e?.message || e));
@@ -53,6 +57,89 @@ async function tg(method, fields = {}, file = null) {
 }
 const say = (text) => tg('sendMessage', { text: String(text).slice(0, 4096) });
 const sayHTML = (text) => tg('sendMessage', { text: String(text).slice(0, 4096), parse_mode: 'HTML' });
+
+// ================= Telegram Forum Topics (proti contact/group er jonno alada topic) =================
+async function getTopicId(jid) {
+  if (!USE_DB) return null;
+  try {
+    const token = await fbToken();
+    const r = await fetch(`${FIREBASE_DB_URL}/tg_topics/${encKey(jid)}.json?access_token=${token}`);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    console.log('getTopicId error:', e.message);
+    return null;
+  }
+}
+async function saveTopicId(jid, threadId) {
+  if (!USE_DB) return;
+  try {
+    const token = await fbToken();
+    await fetch(`${FIREBASE_DB_URL}/tg_topics/${encKey(jid)}.json?access_token=${token}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(threadId),
+    });
+  } catch (e) {
+    console.log('saveTopicId error:', e.message);
+  }
+}
+async function createForumTopic(name) {
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/createForumTopic`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: TG_CHAT, name: String(name).slice(0, 128) }),
+  });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.description || 'createForumTopic failed');
+  return j.result.message_thread_id;
+}
+async function getOrCreateTopic(jid, nameHint) {
+  if (forumDisabled) return null;
+  if (topicCache.has(jid)) return topicCache.get(jid);
+  if (topicLocks.has(jid)) return topicLocks.get(jid);
+
+  const task = (async () => {
+    let id = await getTopicId(jid);
+    if (!id) {
+      try {
+        id = await createForumTopic(nameHint || jid);
+        await saveTopicId(jid, id);
+      } catch (e) {
+        console.log('createForumTopic error:', e.message);
+        if (/not enough rights|administrator|forum|supergroup/i.test(e.message)) {
+          forumDisabled = true;
+          say('⚠️ Topic banano jacche na. Bot k group e admin banao ar group settings e "Topics" chalu koro.\nEkhon theke shob message main chat e ashbe (topic chhara).');
+        }
+        id = null;
+      }
+    }
+    if (id) topicCache.set(jid, id);
+    return id;
+  })();
+
+  topicLocks.set(jid, task);
+  try {
+    return await task;
+  } finally {
+    topicLocks.delete(jid);
+  }
+}
+async function getChatName(jid, pushName) {
+  if (jid.endsWith('@g.us')) {
+    if (groupNameCache.has(jid)) return groupNameCache.get(jid);
+    let name = jid.split('@')[0];
+    try {
+      const meta = await sock.groupMetadata(jid);
+      if (meta?.subject) name = meta.subject;
+    } catch (e) {
+      console.log('groupMetadata error:', e.message);
+    }
+    groupNameCache.set(jid, name);
+    return name;
+  }
+  return pushName || `+${jid.split('@')[0]}`;
+}
 
 // ================= Forward WhatsApp -> Telegram =================
 const MEDIA = {
@@ -93,11 +180,16 @@ async function forwardToTelegram(m) {
     `${m.pushName || 'Unknown'} (+${sender.split('@')[0]})` +
     (jid.endsWith('@g.us') ? ' [group]' : '');
 
+  const chatName = await getChatName(jid, m.pushName);
+  const threadId = await getOrCreateTopic(jid, chatName);
+  const threadField = threadId ? { message_thread_id: threadId } : {};
+  const sayIn = (text) => tg('sendMessage', { text: String(text).slice(0, 4096), ...threadField });
+
   if (type === 'conversation' || type === 'extendedTextMessage') {
     const text = content.conversation || content.extendedTextMessage?.text || '';
     inbox.unshift({ from: jid, name: m.pushName || '', text, time: Date.now() });
     if (inbox.length > 100) inbox.pop();
-    return say(`${label}:\n${text}`);
+    return sayIn(`${label}:\n${text}`);
   }
 
   const cfg = MEDIA[type];
@@ -126,10 +218,10 @@ async function forwardToTelegram(m) {
     if (type === 'audioMessage' && info.ptt) { method = 'sendVoice'; field = 'voice'; }
 
     const caption = `${tag}${label}${info.caption ? '\n' + info.caption : ''}`.slice(0, 1024);
-    await tg(method, { caption }, { field, buffer, name });
+    await tg(method, { caption, ...threadField }, { field, buffer, name });
   } catch (e) {
     console.log('Media forward error:', e.message);
-    say(`${tag}${label}: file download hoy nai (${e.message})`);
+    sayIn(`${tag}${label}: file download hoy nai (${e.message})`);
   }
 }
 
