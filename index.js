@@ -25,6 +25,9 @@ let sock = null;
 let lastQR = null;
 let status = 'starting';
 let notifiedNeedLink = false;
+let registered = false; // age theke kono WhatsApp account pair kora ache kina
+let linking = false; // /qr ba /link ekta shomoy e ekbar e cholche
+let pairingResolve = null;
 const inbox = [];
 
 process.on('unhandledRejection', (e) => console.log('unhandledRejection:', e?.message || e));
@@ -240,8 +243,9 @@ async function clearAuth() {
 // END AUTH
 
 // ================= WhatsApp connection =================
-async function startWA() {
+async function startWA(pairNumber) {
   const { state, saveCreds } = await getAuthState();
+  registered = !!state.creds.registered;
   const { version } = await fetchLatestBaileysVersion();
 
   const s = makeWASocket({
@@ -251,6 +255,15 @@ async function startWA() {
     browser: ['WA Server', 'Chrome', '1.0.0'],
   });
   sock = s;
+
+  // Pairing code WS khola matroi chaite hobe, QR dekha deoar pore na -
+  // tai ekhane kono await dewa jabe na, nahole WhatsApp QR mode e cole jay.
+  if (pairNumber) {
+    s.requestPairingCode(pairNumber).then(
+      (raw) => { if (pairingResolve) pairingResolve({ ok: true, raw }); },
+      (e) => { if (pairingResolve) pairingResolve({ ok: false, error: e.message }); }
+    );
+  }
 
   s.ev.on('creds.update', saveCreds);
 
@@ -270,6 +283,7 @@ async function startWA() {
       lastQR = null;
       status = 'connected';
       notifiedNeedLink = false;
+      registered = true;
       console.log('WhatsApp connected');
       say('✅ WhatsApp connected. Ekhon theke message/file ekhane ashbe.');
     }
@@ -282,6 +296,7 @@ async function startWA() {
         await clearAuth();
         lastQR = null;
         notifiedNeedLink = false;
+        registered = false;
         say('⚠️ WhatsApp logged out hoyeche. Abar link korte /qr ba /link NUMBER pathao.');
         setTimeout(() => startWA().catch((e) => console.log('restart error:', e.message)), 2000);
       } else {
@@ -298,6 +313,19 @@ async function startWA() {
       forwardToTelegram(m).catch((e) => console.log('forward error:', e.message));
     }
   });
+}
+
+// Notun kore QR ba pairing code neoar jonne, purono session muche fresh socket banay
+async function relink(pairNumber) {
+  const old = sock;
+  await clearAuth();
+  lastQR = null;
+  notifiedNeedLink = false;
+  registered = false;
+  await startWA(pairNumber);
+  if (old) {
+    try { old.end(new Error('Relinking')); } catch (e) { /* ignore */ }
+  }
 }
 
 async function waitForQR(ms = 25000) {
@@ -337,36 +365,63 @@ async function handleCommand(text) {
 
   if (cmd === '/qr') {
     if (status === 'connected') return say('Already connected ✅. Notun kore link korte age /logout dao.');
-    say('QR toiri hocche, ektu opekkha koro...');
-    const ok = await waitForQR();
-    if (!ok) return say(status === 'connected' ? 'Already connected ✅' : 'QR ashe nai. Ektu pore abar /qr dao.');
-    const buffer = await QRCode.toBuffer(lastQR, { width: 500, margin: 2 });
-    await tg('sendPhoto', {
-      caption: 'Onno ekta device e eta kholo, tarpor tomar phone e WhatsApp > Linked devices > Link a device diye scan koro.\n\nQR 20 second e expire hoy, na hole abar /qr dao.\n\nEkoi phone e thakle /link NUMBER babohar koro.',
-    }, { field: 'photo', buffer, name: 'qr.png' });
+    if (registered && status !== 'waiting_qr') {
+      return say('Age theke ekta WhatsApp session ache, reconnect hocche. Notun kore QR nite hole age /logout dao.');
+    }
+    if (linking) return say('Ektu ager kaj cholche, ektu opekkha koro...');
+    linking = true;
+    try {
+      say('QR toiri hocche, ektu opekkha koro...');
+      await relink();
+      const ok = await waitForQR();
+      if (!ok) return say(status === 'connected' ? 'Already connected ✅' : 'QR ashe nai. Ektu pore abar /qr dao.');
+      const buffer = await QRCode.toBuffer(lastQR, { width: 500, margin: 2 });
+      await tg('sendPhoto', {
+        caption: 'Onno ekta device e eta kholo, tarpor tomar phone e WhatsApp > Linked devices > Link a device diye scan koro.\n\nQR 20 second e expire hoy, na hole abar /qr dao.\n\nEkoi phone e thakle /link NUMBER babohar koro.',
+      }, { field: 'photo', buffer, name: 'qr.png' });
+    } catch (e) {
+      console.log('qr error:', e.message);
+      say('QR toiri hoy nai: ' + e.message);
+    } finally {
+      linking = false;
+    }
     return;
   }
 
   if (cmd === '/link') {
     if (status === 'connected') return say('Already connected ✅. Notun kore link korte age /logout dao.');
+    if (registered && status !== 'waiting_qr') {
+      return say('Age theke ekta WhatsApp session ache, reconnect hocche. Notun number link korte age /logout dao.');
+    }
     const number = (args[0] || '').replace(/\D/g, '');
     if (number.length < 8) {
       return say('Number den: /link 8801XXXXXXXXX\n(country code shoho, + ba space chhara)');
     }
+    if (linking) return say('Ektu ager kaj cholche, ektu opekkha koro...');
+    linking = true;
     say('Code toiri hocche, ektu opekkha koro...');
-    const ready = await waitForQR();
-    if (!ready) return say(status === 'connected' ? 'Already connected ✅' : 'Server ready na. Ektu pore abar chesta koro.');
     try {
-      const raw = await sock.requestPairingCode(number);
+      const result = await new Promise((resolve) => {
+        pairingResolve = resolve;
+        relink(number).catch((e) => resolve({ ok: false, error: e.message }));
+        setTimeout(() => resolve({ ok: false, error: 'Shomoy sesh hoye geche (timeout), abar chesta koro' }), 20000);
+      });
+      pairingResolve = null;
+      if (!result.ok) {
+        return say('Code toiri hoy nai: ' + result.error + '\nAbar /link dao, ba /qr babohar koro.');
+      }
+      const code = result.raw.match(/.{1,4}/g).join('-');
       await sayHTML(
         'Phone e: WhatsApp > Linked devices > Link a device > "Link with phone number instead" e jao.\n\n' +
-        'Niche code e ekbar chap dilei copy hoye jabe, tarpor WhatsApp e paste koro 👇'
+        'Niche code e ekbar chap dilei copy hoye jabe, tarpor WhatsApp e 60 second er moddhe paste koro 👇'
       );
-      await sayHTML(`<code>${raw}</code>`);
+      await sayHTML(`<code>${code}</code>`);
       return say('Code kaj na korle /link abar dao.');
     } catch (e) {
       console.log('pairing error:', e.message);
       return say('Code toiri hoy nai: ' + e.message + '\nAbar /link dao, ba /qr babohar koro.');
+    } finally {
+      linking = false;
     }
   }
 
