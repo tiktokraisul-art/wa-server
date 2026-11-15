@@ -30,6 +30,20 @@ let linking = false; // /qr ba /link ekta shomoy e ekbar e cholche
 let pairingResolve = null;
 const inbox = [];
 const topicCache = new Map();   // jid -> message_thread_id (ei process-e cache)
+const threadToJid = new Map();  // message_thread_id -> jid (Telegram theke reply pathate)
+
+// WA message id <-> Telegram message mapping (delete-mark ar reaction forward korar jonne).
+// Boro hote hote memory na bhore jay tai ekta simple size-capped Map.
+const MAP_CAP = 2000;
+function boundedSet(map, key, value) {
+  if (map.size >= MAP_CAP) {
+    const oldestKey = map.keys().next().value;
+    map.delete(oldestKey);
+  }
+  map.set(key, value);
+}
+const waIdToTg = new Map();   // `${jid}:${waMsgId}` -> { chatId, messageId, isCaption }
+const tgMsgToWa = new Map();  // `${chatId}:${messageId}` -> { jid, key }
 const topicLocks = new Map();   // jid -> in-flight creation promise
 const groupNameCache = new Map();
 let forumDisabled = false;      // group e Topics chalu na thakle true hoye jabe
@@ -39,7 +53,7 @@ process.on('uncaughtException', (e) => console.log('uncaughtException:', e?.mess
 
 // ================= Telegram helpers =================
 async function tg(method, fields = {}, file = null) {
-  if (!TG_TOKEN || !TG_CHAT) return console.log('Telegram env set kora nai');
+  if (!TG_TOKEN || !TG_CHAT) { console.log('Telegram env set kora nai'); return null; }
   const form = new FormData();
   form.append('chat_id', TG_CHAT);
   for (const [k, v] of Object.entries(fields)) form.append(k, String(v));
@@ -51,8 +65,26 @@ async function tg(method, fields = {}, file = null) {
     });
     const j = await r.json();
     if (!j.ok) console.log('Telegram error:', j.description);
+    return j;
   } catch (e) {
     console.log('Telegram fetch error:', e.message);
+    return null;
+  }
+}
+async function tgJSON(method, bodyObj) {
+  if (!TG_TOKEN) { console.log('Telegram env set kora nai'); return null; }
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(bodyObj),
+    });
+    const j = await r.json();
+    if (!j.ok) console.log('Telegram error (' + method + '):', j.description);
+    return j;
+  } catch (e) {
+    console.log('Telegram fetch error (' + method + '):', e.message);
+    return null;
   }
 }
 const say = (text) => tg('sendMessage', { text: String(text).slice(0, 4096) });
@@ -82,6 +114,35 @@ async function saveTopicId(jid, threadId) {
     });
   } catch (e) {
     console.log('saveTopicId error:', e.message);
+  }
+}
+async function getJidByThread(threadId) {
+  if (threadToJid.has(threadId)) return threadToJid.get(threadId);
+  if (!USE_DB) return null;
+  try {
+    const token = await fbToken();
+    const r = await fetch(`${FIREBASE_DB_URL}/tg_topic_jid/${threadId}.json?access_token=${token}`);
+    if (!r.ok) return null;
+    const jid = await r.json();
+    if (jid) threadToJid.set(threadId, jid);
+    return jid;
+  } catch (e) {
+    console.log('getJidByThread error:', e.message);
+    return null;
+  }
+}
+async function saveJidByThread(threadId, jid) {
+  threadToJid.set(threadId, jid);
+  if (!USE_DB) return;
+  try {
+    const token = await fbToken();
+    await fetch(`${FIREBASE_DB_URL}/tg_topic_jid/${threadId}.json?access_token=${token}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(jid),
+    });
+  } catch (e) {
+    console.log('saveJidByThread error:', e.message);
   }
 }
 async function createForumTopic(name) {
@@ -114,7 +175,11 @@ async function getOrCreateTopic(jid, nameHint) {
         id = null;
       }
     }
-    if (id) topicCache.set(jid, id);
+    if (id) {
+      topicCache.set(jid, id);
+      threadToJid.set(id, jid);
+      await saveJidByThread(id, jid); // reply-to-WhatsApp er jonno reverse mapping o save kori
+    }
     return id;
   })();
 
@@ -158,9 +223,40 @@ function isViewOnceRaw(raw) {
   return !!(raw.viewOnceMessage || raw.viewOnceMessageV2 || raw.viewOnceMessageV2Extension);
 }
 
+// Mucche fela (delete for everyone) message dhorle, matching Telegram message e
+// "(deleted message)" jog kore dey
+async function handleRevoke(m) {
+  const pm = m.message?.protocolMessage;
+  if (!pm || !pm.key) return;
+  if (pm.type !== 0 && pm.type !== 'REVOKE') return;
+
+  const jid = m.key.remoteJid;
+  const mapKey = `${jid}:${pm.key.id}`;
+  const info = waIdToTg.get(mapKey);
+  if (!info) return; // amra age forward kori nai, kichu korar nai
+
+  if (info.isCaption) {
+    await tgJSON('editMessageCaption', {
+      chat_id: info.chatId,
+      message_id: info.messageId,
+      caption: (info.caption || '').slice(0, 1000) + '\n\n(deleted message)',
+    });
+  } else {
+    await tgJSON('editMessageText', {
+      chat_id: info.chatId,
+      message_id: info.messageId,
+      text: (info.text || '').slice(0, 4000) + '\n\n(deleted message)',
+    });
+  }
+}
+
 async function forwardToTelegram(m) {
   const jid = m.key.remoteJid;
   if (jid === 'status@broadcast' && !INCLUDE_STATUS) return;
+
+  if (m.message?.protocolMessage) {
+    return handleRevoke(m);
+  }
 
   const content = normalizeMessageContent(m.message);
   if (!content) return;
@@ -185,11 +281,19 @@ async function forwardToTelegram(m) {
   const threadField = threadId ? { message_thread_id: threadId } : {};
   const sayIn = (text) => tg('sendMessage', { text: String(text).slice(0, 4096), ...threadField });
 
+  const mapKey = `${jid}:${m.key.id}`;
+
   if (type === 'conversation' || type === 'extendedTextMessage') {
     const text = content.conversation || content.extendedTextMessage?.text || '';
     inbox.unshift({ from: jid, name: m.pushName || '', text, time: Date.now() });
     if (inbox.length > 100) inbox.pop();
-    return sayIn(`${label}:\n${text}`);
+    const fullText = `${label}:\n${text}`;
+    const res = await sayIn(fullText);
+    if (res?.ok) {
+      boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: false, text: fullText });
+      boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
+    }
+    return;
   }
 
   const cfg = MEDIA[type];
@@ -218,7 +322,11 @@ async function forwardToTelegram(m) {
     if (type === 'audioMessage' && info.ptt) { method = 'sendVoice'; field = 'voice'; }
 
     const caption = `${tag}${label}${info.caption ? '\n' + info.caption : ''}`.slice(0, 1024);
-    await tg(method, { caption, ...threadField }, { field, buffer, name });
+    const res = await tg(method, { caption, ...threadField }, { field, buffer, name });
+    if (res?.ok) {
+      boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: true, caption });
+      boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
+    }
   } catch (e) {
     console.log('Media forward error:', e.message);
     sayIn(`${tag}${label}: file download hoy nai (${e.message})`);
@@ -535,6 +643,89 @@ async function handleCommand(text) {
   }
 }
 
+async function replyToWhatsApp(threadId, text) {
+  const jid = await getJidByThread(threadId);
+  if (!jid) return; // General topic ba na-chena thread - kichu kora hobe na
+  if (status !== 'connected') {
+    return tg('sendMessage', {
+      text: '⚠️ WhatsApp ekhon connected nai, message পাঠানো gelo na.',
+      message_thread_id: threadId,
+    });
+  }
+  try {
+    await sock.sendMessage(jid, { text });
+  } catch (e) {
+    console.log('reply-to-whatsapp error:', e.message);
+    tg('sendMessage', { text: '⚠️ Message pathano gelo na: ' + e.message, message_thread_id: threadId });
+  }
+}
+
+// Telegram theke file/photo download kore Buffer hisebe ferot dey
+async function tgDownloadFile(fileId) {
+  const infoRes = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getFile?file_id=${fileId}`);
+  const info = await infoRes.json();
+  if (!info.ok) throw new Error(info.description || 'getFile failed');
+  const fileRes = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${info.result.file_path}`);
+  const arrBuf = await fileRes.arrayBuffer();
+  return Buffer.from(arrBuf);
+}
+
+// Telegram theke pathano chobi/file/voice WhatsApp e forward kore
+async function replyMediaToWhatsApp(threadId, msg) {
+  const jid = await getJidByThread(threadId);
+  if (!jid) return;
+  if (status !== 'connected') {
+    return tg('sendMessage', {
+      text: '⚠️ WhatsApp ekhon connected nai, file পাঠানো gelo na.',
+      message_thread_id: threadId,
+    });
+  }
+  try {
+    let content;
+    const caption = msg.caption || undefined;
+    if (msg.photo) {
+      const biggest = msg.photo[msg.photo.length - 1];
+      const buffer = await tgDownloadFile(biggest.file_id);
+      content = { image: buffer, caption };
+    } else if (msg.video) {
+      const buffer = await tgDownloadFile(msg.video.file_id);
+      content = { video: buffer, caption };
+    } else if (msg.voice) {
+      const buffer = await tgDownloadFile(msg.voice.file_id);
+      content = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt: true };
+    } else if (msg.audio) {
+      const buffer = await tgDownloadFile(msg.audio.file_id);
+      content = { audio: buffer, mimetype: msg.audio.mime_type || 'audio/mpeg' };
+    } else if (msg.document) {
+      const buffer = await tgDownloadFile(msg.document.file_id);
+      content = { document: buffer, mimetype: msg.document.mime_type, fileName: msg.document.file_name, caption };
+    } else if (msg.sticker) {
+      const buffer = await tgDownloadFile(msg.sticker.file_id);
+      content = { sticker: buffer };
+    } else {
+      return;
+    }
+    await sock.sendMessage(jid, content);
+  } catch (e) {
+    console.log('reply-media-to-whatsapp error:', e.message);
+    tg('sendMessage', { text: '⚠️ File pathano gelo na: ' + e.message, message_thread_id: threadId });
+  }
+}
+
+// Telegram e kono forward-kora message e react korle, ota WhatsApp e o react hisebe cole jay
+async function handleTelegramReaction(mr) {
+  const key = `${mr.chat.id}:${mr.message_id}`;
+  const info = tgMsgToWa.get(key);
+  if (!info) return; // ei message ta amader map e nai (purono/restart-er age kar hote pare)
+  if (status !== 'connected') return;
+  const emoji = mr.new_reaction?.[0]?.emoji || ''; // khali mane reaction tule newa hoyeche
+  try {
+    await sock.sendMessage(info.jid, { react: { text: emoji, key: info.key } });
+  } catch (e) {
+    console.log('reaction forward error:', e.message);
+  }
+}
+
 async function pollTelegram() {
   if (!TG_TOKEN || !TG_CHAT) return console.log('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID set koro');
   let offset = 0;
@@ -556,10 +747,12 @@ async function pollTelegram() {
     console.log('tg init error:', e.message);
   }
 
+  const ALLOWED_UPDATES = JSON.stringify(['message', 'message_reaction']);
+
   while (true) {
     try {
       const r = await fetch(
-        `https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=30&offset=${offset}`
+        `https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=30&offset=${offset}&allowed_updates=${encodeURIComponent(ALLOWED_UPDATES)}`
       );
       const j = await r.json();
       if (!j.ok) {
@@ -569,14 +762,41 @@ async function pollTelegram() {
       }
       for (const u of j.result) {
         offset = u.update_id + 1;
+
+        if (u.message_reaction) {
+          if (String(u.message_reaction.chat.id) !== TG_CHAT) continue;
+          handleTelegramReaction(u.message_reaction).catch((e) =>
+            console.log('handleTelegramReaction error:', e.message)
+          );
+          continue;
+        }
+
         const msg = u.message;
-        if (!msg || !msg.text) continue;
-        if (String(msg.chat.id) !== TG_CHAT) continue; // shudhu tumi
-        if (!msg.text.startsWith('/')) continue;
-        handleCommand(msg.text).catch((e) => {
-          console.log('command error:', e.message);
-          say('Error: ' + e.message);
-        });
+        if (!msg) continue;
+        if (String(msg.chat.id) !== TG_CHAT) continue; // shudhu amader group
+        if (msg.from?.is_bot) continue; // bot nijer message abar na porke
+
+        if (msg.text?.startsWith('/')) {
+          handleCommand(msg.text).catch((e) => {
+            console.log('command error:', e.message);
+            say('Error: ' + e.message);
+          });
+          continue;
+        }
+
+        if (!msg.message_thread_id) continue; // General topic - kichu kora hobe na
+
+        if (msg.text) {
+          // Kono Topic er bhetore shadharon text likhle, ota shei contact er
+          // WhatsApp number e reply hisebe cole jay
+          replyToWhatsApp(msg.message_thread_id, msg.text).catch((e) =>
+            console.log('replyToWhatsApp error:', e.message)
+          );
+        } else if (msg.photo || msg.video || msg.voice || msg.audio || msg.document || msg.sticker) {
+          replyMediaToWhatsApp(msg.message_thread_id, msg).catch((e) =>
+            console.log('replyMediaToWhatsApp error:', e.message)
+          );
+        }
       }
     } catch (e) {
       console.log('poll error:', e.message);
