@@ -569,6 +569,11 @@ async function startWA(pairNumber) {
       registered = true;
       console.log('WhatsApp connected');
       say('✅ WhatsApp connected. Ekhon theke message/file ekhane ashbe.');
+      // Bot 24/7 connected thake bole WhatsApp "always online" dekhay; nijeke
+      // unavailable bole jaliye dilei online/last-seen sudhu phone er obostha onujayi dekhabe
+      s.sendPresenceUpdate('unavailable').catch((e) =>
+        console.log('sendPresenceUpdate error:', e.message)
+      );
     }
 
     if (connection === 'close') {
