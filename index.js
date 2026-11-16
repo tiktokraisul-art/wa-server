@@ -49,8 +49,15 @@ const topicLocks = new Map();   // jid -> in-flight creation promise
 const groupNameCache = new Map();
 let forumDisabled = false;      // group e Topics chalu na thakle true hoye jabe
 
-process.on('unhandledRejection', (e) => console.log('unhandledRejection:', e?.message || e));
-process.on('uncaughtException', (e) => console.log('uncaughtException:', e?.message || e));
+// e?.message || e kokhono kokhono puro object (session/crypto key shoho) print kore felte pare -
+// tai shudhu message ba stack-er prothom line i log kori, kokhono puro object na.
+function safeErrText(e) {
+  if (e instanceof Error) return e.stack?.split('\n')[0] || e.message;
+  if (typeof e === 'string') return e;
+  return 'non-error thrown (type: ' + typeof e + ')';
+}
+process.on('unhandledRejection', (e) => console.log('unhandledRejection:', safeErrText(e)));
+process.on('uncaughtException', (e) => console.log('uncaughtException:', safeErrText(e)));
 
 // ================= Telegram helpers =================
 async function tg(method, fields = {}, file = null) {
