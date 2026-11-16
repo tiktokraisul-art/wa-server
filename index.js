@@ -717,8 +717,17 @@ async function handleCommand(text) {
 }
 
 async function replyToWhatsApp(threadId, text) {
+  console.log('replyToWhatsApp: threadId=', threadId, 'textLen=', text?.length);
   const jid = await getJidByThread(threadId);
-  if (!jid) return; // General topic ba na-chena thread - kichu kora hobe na
+  console.log('replyToWhatsApp: resolved jid=', jid);
+  if (!jid) {
+    // Age chupchap kichu na kore chole jeto - ekhon keno pathano gelo na seta
+    // Telegram e e dekhiye dicchi, jate bujha jay sommosya ki.
+    return tg('sendMessage', {
+      text: '⚠️ Ei topic ta kono WhatsApp contact er shathe match pawa jacche na (threadId: ' + threadId + '). Topic ta notun kore message asle banbe.',
+      message_thread_id: threadId,
+    });
+  }
   if (status !== 'connected') {
     return tg('sendMessage', {
       text: '⚠️ WhatsApp ekhon connected nai, message পাঠানো gelo na.',
@@ -726,7 +735,8 @@ async function replyToWhatsApp(threadId, text) {
     });
   }
   try {
-    await sock.sendMessage(jid, { text });
+    const res = await sock.sendMessage(jid, { text });
+    console.log('replyToWhatsApp: sent ok, wa message id=', res?.key?.id);
   } catch (e) {
     console.log('reply-to-whatsapp error:', e.message);
     tg('sendMessage', { text: '⚠️ Message pathano gelo na: ' + e.message, message_thread_id: threadId });
