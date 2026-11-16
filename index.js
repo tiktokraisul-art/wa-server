@@ -44,6 +44,7 @@ function boundedSet(map, key, value) {
 }
 const waIdToTg = new Map();   // `${jid}:${waMsgId}` -> { chatId, messageId, isCaption }
 const tgMsgToWa = new Map();  // `${chatId}:${messageId}` -> { jid, key }
+const outgoingWaToTg = new Map(); // `${jid}:${waMsgId}` -> { chatId, messageId } - amader pathano reply er status (sent/delivered/seen) dekhate
 const topicLocks = new Map();   // jid -> in-flight creation promise
 const groupNameCache = new Map();
 let forumDisabled = false;      // group e Topics chalu na thakle true hoye jabe
@@ -70,6 +71,13 @@ async function tg(method, fields = {}, file = null) {
     console.log('Telegram fetch error:', e.message);
     return null;
   }
+}
+async function setTgReaction(chatId, messageId, emoji) {
+  return tgJSON('setMessageReaction', {
+    chat_id: chatId,
+    message_id: messageId,
+    reaction: emoji ? [{ type: 'emoji', emoji }] : [],
+  });
 }
 async function tgJSON(method, bodyObj) {
   if (!TG_TOKEN) { console.log('Telegram env set kora nai'); return null; }
@@ -593,6 +601,27 @@ async function startWA(pairNumber) {
     if (s !== sock) return;
     handlePresenceUpdate(id, presences).catch((e) => console.log('presence handle error:', e.message));
   });
+
+  // Amra WhatsApp e ja পাঠাই, tar status (sent/delivered/seen) e update ashle
+  // matching Telegram message e reaction diye dekhiye dei
+  s.ev.on('messages.update', (updates) => {
+    for (const u of updates) {
+      const st = u.update?.status;
+      if (st == null) continue;
+      const mapKey = `${u.key.remoteJid}:${u.key.id}`;
+      const info = outgoingWaToTg.get(mapKey);
+      if (!info) continue;
+      let emoji = null;
+      if (st === 2) emoji = '🕐';       // SERVER_ACK - WA server e pouche geche
+      else if (st === 3) emoji = '✅';  // DELIVERY_ACK - recipient er phone e pouche geche
+      else if (st === 4) emoji = '👀';  // READ - dekhe fele geche
+      if (emoji) {
+        setTgReaction(info.chatId, info.messageId, emoji).catch((e) =>
+          console.log('status reaction error:', e.message)
+        );
+      }
+    }
+  });
 }
 
 // Notun kore QR ba pairing code neoar jonne, purono session muche fresh socket banay
@@ -716,7 +745,7 @@ async function handleCommand(text) {
   }
 }
 
-async function replyToWhatsApp(threadId, text) {
+async function replyToWhatsApp(threadId, text, tgMessageId) {
   console.log('replyToWhatsApp: threadId=', threadId, 'textLen=', text?.length);
   const jid = await getJidByThread(threadId);
   console.log('replyToWhatsApp: resolved jid=', jid);
@@ -737,6 +766,10 @@ async function replyToWhatsApp(threadId, text) {
   try {
     const res = await sock.sendMessage(jid, { text });
     console.log('replyToWhatsApp: sent ok, wa message id=', res?.key?.id);
+    if (res?.key?.id && tgMessageId) {
+      boundedSet(outgoingWaToTg, `${jid}:${res.key.id}`, { chatId: TG_CHAT, messageId: tgMessageId });
+      setTgReaction(TG_CHAT, tgMessageId, '🕐').catch(() => {}); // "pathano hoyeche" - WA server theke ack asar age
+    }
   } catch (e) {
     console.log('reply-to-whatsapp error:', e.message);
     tg('sendMessage', { text: '⚠️ Message pathano gelo na: ' + e.message, message_thread_id: threadId });
@@ -845,8 +878,10 @@ async function pollTelegram() {
       }
       for (const u of j.result) {
         offset = u.update_id + 1;
+        console.log('tg update keys:', Object.keys(u).filter((k) => k !== 'update_id'));
 
         if (u.message_reaction) {
+          console.log('message_reaction raw:', JSON.stringify(u.message_reaction));
           if (String(u.message_reaction.chat.id) !== TG_CHAT) continue;
           handleTelegramReaction(u.message_reaction).catch((e) =>
             console.log('handleTelegramReaction error:', e.message)
@@ -872,7 +907,7 @@ async function pollTelegram() {
         if (msg.text) {
           // Kono Topic er bhetore shadharon text likhle, ota shei contact er
           // WhatsApp number e reply hisebe cole jay
-          replyToWhatsApp(msg.message_thread_id, msg.text).catch((e) =>
+          replyToWhatsApp(msg.message_thread_id, msg.text, msg.message_id).catch((e) =>
             console.log('replyToWhatsApp error:', e.message)
           );
         } else if (msg.photo || msg.video || msg.voice || msg.audio || msg.document || msg.sticker) {
