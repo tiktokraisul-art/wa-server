@@ -351,7 +351,7 @@ async function forwardToTelegram(m) {
   const type = getContentType(content);
 
   // Debug log (Render Logs e dekha jabe) - kon type ashche bujhte
-  console.log('incoming:', type, 'viewOnceFlag:', content[type]?.viewOnce === true, 'fromMe:', m.key.fromMe);
+  console.log('incoming:', type, 'jid:', jid, 'viewOnceFlag:', content[type]?.viewOnce === true, 'fromMe:', m.key.fromMe);
 
   const raw = m.message;
   const isViewOnce =
