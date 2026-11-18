@@ -340,12 +340,18 @@ async function forwardToTelegram(m) {
     return handleRevoke(m);
   }
 
+  if (m.key.fromMe) {
+    // Amra nijera (bot diye, Telegram theke reply kore) ei message pathiyechi kina check kori -
+    // na hole Telegram e nijer lekha message abar duplicate hoye ashbe
+    if (outgoingWaToTg.has(`${jid}:${m.key.id}`)) return;
+  }
+
   const content = normalizeMessageContent(m.message);
   if (!content) return;
   const type = getContentType(content);
 
   // Debug log (Render Logs e dekha jabe) - kon type ashche bujhte
-  console.log('incoming:', type, 'viewOnceFlag:', content[type]?.viewOnce === true);
+  console.log('incoming:', type, 'viewOnceFlag:', content[type]?.viewOnce === true, 'fromMe:', m.key.fromMe);
 
   const raw = m.message;
   const isViewOnce =
@@ -354,9 +360,10 @@ async function forwardToTelegram(m) {
   const tag = isViewOnce ? '👁 VIEW ONCE\n' : '';
 
   const sender = m.key.participant || jid;
-  const label =
-    `${m.pushName || 'Unknown'} (+${sender.split('@')[0]})` +
-    (jid.endsWith('@g.us') ? ' [group]' : '');
+  const label = m.key.fromMe
+    ? 'Tumi (phone theke)' + (jid.endsWith('@g.us') ? ' [group]' : '')
+    : `${m.pushName || 'Unknown'} (+${sender.split('@')[0]})` +
+      (jid.endsWith('@g.us') ? ' [group]' : '');
 
   const chatName = await getChatName(jid, m.pushName);
   const threadId = await getOrCreateTopic(jid, chatName);
@@ -604,7 +611,10 @@ async function startWA(pairNumber) {
   s.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const m of messages) {
-      if (!m.message || m.key.fromMe) continue;
+      if (!m.message) continue;
+      // fromMe:true o ekhon forward kori (phone theke pathano message dekhanor jonne);
+      // amra nijera Telegram theke pathano reply abar duplicate hishebe asha thekate
+      // forwardToTelegram nijei check kore (outgoingWaToTg te thakle skip kore)
       forwardToTelegram(m).catch((e) => console.log('forward error:', e.message));
     }
   });
