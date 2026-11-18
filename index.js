@@ -20,7 +20,7 @@ const INCLUDE_STATUS = process.env.INCLUDE_STATUS === 'true';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 // Model er naam Google maje majei bodlay; kaj na korle aistudio.google.com e
 // giye current free model er naam dekhe GEMINI_MODEL env e boshao.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -247,37 +247,55 @@ async function getChatName(jid, pushName) {
   return pushName || `+${jid.split('@')[0]}`;
 }
 
-// ================= Gemini AI (@gemini mention) =================
-async function askGemini(prompt) {
+// ================= RN AI (@rn mention, Gemini-chalito) =================
+// RN AI shadharonoto nijeke ei naam e e porichoy dibe, Gemini/Google er naam
+// nijer theke bolbe na. Tobe keu sotti-i soja jiggesh korle mittha bolbe na.
+const RN_SYSTEM_INSTRUCTION =
+  'Tomar naam "Raisul Network AI" (songkhipto rupe RN AI). Shadharonoto nijeke ' +
+  'ei naam e i porichoy dao; Google ba Gemini er kotha nijer theke kokhono bolo na. ' +
+  'Tobe keu jodi sotti-i soja jiggesh kore "tumi ki Gemini?" ba "tumi ki Google er toiri?" ' +
+  'tahole mittha bolba na - shottota shikar koro j tumi Gemini-bhittik, tarpor abar ' +
+  'RN AI porichoy e fire eso. Bangla ba English - jei bhashay prashno ashbe, shei ' +
+  'bhashatei shadharon, bondhushulov vabe uttor dao.';
+
+async function askRnAI(parts) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY set kora nai');
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
   const r = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: RN_SYSTEM_INSTRUCTION }] },
+      contents: [{ parts }],
+    }),
   });
   const j = await r.json();
-  if (!r.ok) throw new Error(j.error?.message || ('Gemini API error ' + r.status));
+  if (!r.ok) throw new Error(j.error?.message || ('RN AI API error ' + r.status));
   const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
-  if (!text) throw new Error('Gemini theke khali uttor eshece');
+  if (!text) throw new Error('RN AI theke khali uttor eshece');
   return text;
 }
 
-// text e "@gemini ..." thakle prompt ta ber kore dey, na thakle null
-function extractGeminiPrompt(text) {
+// text e "@rn ..." thakle prompt ta ber kore dey (khali hole ''), na thakle null
+function extractRnPrompt(text) {
   if (!text) return null;
-  const m = /@gemini\s+([\s\S]+)/i.exec(text);
+  const m = /@rn\b[:\s]*([\s\S]*)/i.exec(text);
   return m ? m[1].trim() : null;
 }
 
-// Gemini-ke jiggesh kore WhatsApp (shei jid e) ar Telegram (shei topic e) dutoy uttor pathay
-async function handleGeminiMention(prompt, jid, threadId) {
+// RN AI-ke jiggesh kore WhatsApp (shei jid e) ar Telegram (shei topic e) dutoy uttor pathay.
+// mediaPart dile (chobi/audio) multimodal hishebe pathano hoy.
+async function handleRnMention(prompt, jid, threadId, mediaPart) {
+  const textPrompt = prompt || (mediaPart ? 'Ei file ta bishleshon koro, ki ache eita bolo.' : '');
+  if (!textPrompt && !mediaPart) return; // kichu jiggesh kora hoyni
+  const parts = mediaPart ? [mediaPart, { text: textPrompt }] : [{ text: textPrompt }];
+
   let answer;
   try {
-    answer = await askGemini(prompt);
+    answer = await askRnAI(parts);
   } catch (e) {
-    console.log('askGemini error:', e.message);
-    const errText = '⚠️ Gemini theke uttor pawa jay nai: ' + e.message;
+    console.log('askRnAI error:', e.message);
+    const errText = '⚠️ RN AI theke uttor pawa jay nai: ' + e.message;
     if (status === 'connected') sock.sendMessage(jid, { text: errText }).catch(() => {});
     tg('sendMessage', { text: errText, message_thread_id: threadId });
     return;
@@ -290,10 +308,10 @@ async function handleGeminiMention(prompt, jid, threadId) {
         boundedSet(outgoingWaToTg, `${jid}:${res.key.id}`, { chatId: TG_CHAT, messageId: null });
       }
     } catch (e) {
-      console.log('gemini WA send error:', e.message);
+      console.log('rn ai WA send error:', e.message);
     }
   }
-  tg('sendMessage', { text: `🤖 Gemini:\n${answer}`, message_thread_id: threadId });
+  tg('sendMessage', { text: `🤖 RN AI:\n${answer}`, message_thread_id: threadId });
 }
 
 // ================= Online/Last seen tracking =================
@@ -436,10 +454,10 @@ async function forwardToTelegram(m) {
       boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: false, text: fullText });
       boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
     }
-    // Shudhu tumi nijer phone theke @gemini likhle i trigger hobe, onno keu likhle na
-    if (m.key.fromMe) {
-      const prompt = extractGeminiPrompt(text);
-      if (prompt) handleGeminiMention(prompt, jid, threadId).catch((e) => console.log('gemini mention error:', e.message));
+    // Ekhon je kew @rn likhle i trigger hobe (tumi phone theke, ba onno keu)
+    const rnPrompt = extractRnPrompt(text);
+    if (rnPrompt !== null) {
+      handleRnMention(rnPrompt, jid, threadId).catch((e) => console.log('rn mention error:', e.message));
     }
     return;
   }
@@ -846,9 +864,9 @@ async function replyToWhatsApp(threadId, text, tgMessageId) {
 
   // "@gemini ..." likhle eta ar shadharon reply hishebe WA te jabe na - shudhu
   // Gemini-ke jiggesh kore uttor ta WA + Telegram dutoy pathiye dei
-  const geminiPrompt = extractGeminiPrompt(text);
-  if (geminiPrompt) {
-    return handleGeminiMention(geminiPrompt, jid, threadId);
+  const rnPrompt = extractRnPrompt(text);
+  if (rnPrompt !== null) {
+    return handleRnMention(rnPrompt, jid, threadId);
   }
   try {
     const res = await sock.sendMessage(jid, { text });
