@@ -17,6 +17,10 @@ const API_KEY = process.env.API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_CHAT = String(process.env.TELEGRAM_CHAT_ID || '');
 const INCLUDE_STATUS = process.env.INCLUDE_STATUS === 'true';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+// Model er naam Google maje majei bodlay; kaj na korle aistudio.google.com e
+// giye current free model er naam dekhe GEMINI_MODEL env e boshao.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -243,6 +247,55 @@ async function getChatName(jid, pushName) {
   return pushName || `+${jid.split('@')[0]}`;
 }
 
+// ================= Gemini AI (@gemini mention) =================
+async function askGemini(prompt) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY set kora nai');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error?.message || ('Gemini API error ' + r.status));
+  const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+  if (!text) throw new Error('Gemini theke khali uttor eshece');
+  return text;
+}
+
+// text e "@gemini ..." thakle prompt ta ber kore dey, na thakle null
+function extractGeminiPrompt(text) {
+  if (!text) return null;
+  const m = /@gemini\s+([\s\S]+)/i.exec(text);
+  return m ? m[1].trim() : null;
+}
+
+// Gemini-ke jiggesh kore WhatsApp (shei jid e) ar Telegram (shei topic e) dutoy uttor pathay
+async function handleGeminiMention(prompt, jid, threadId) {
+  let answer;
+  try {
+    answer = await askGemini(prompt);
+  } catch (e) {
+    console.log('askGemini error:', e.message);
+    const errText = '⚠️ Gemini theke uttor pawa jay nai: ' + e.message;
+    if (status === 'connected') sock.sendMessage(jid, { text: errText }).catch(() => {});
+    tg('sendMessage', { text: errText, message_thread_id: threadId });
+    return;
+  }
+
+  if (status === 'connected') {
+    try {
+      const res = await sock.sendMessage(jid, { text: '🤖 ' + answer });
+      if (res?.key?.id) {
+        boundedSet(outgoingWaToTg, `${jid}:${res.key.id}`, { chatId: TG_CHAT, messageId: null });
+      }
+    } catch (e) {
+      console.log('gemini WA send error:', e.message);
+    }
+  }
+  tg('sendMessage', { text: `🤖 Gemini:\n${answer}`, message_thread_id: threadId });
+}
+
 // ================= Online/Last seen tracking =================
 const subscribedPresence = new Set(); // jid - already subscribe kora hoyeche
 const lastPresence = new Map();       // jid -> 'available' | 'unavailable' (last pathano state)
@@ -382,6 +435,11 @@ async function forwardToTelegram(m) {
     if (res?.ok) {
       boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: false, text: fullText });
       boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
+    }
+    // Shudhu tumi nijer phone theke @gemini likhle i trigger hobe, onno keu likhle na
+    if (m.key.fromMe) {
+      const prompt = extractGeminiPrompt(text);
+      if (prompt) handleGeminiMention(prompt, jid, threadId).catch((e) => console.log('gemini mention error:', e.message));
     }
     return;
   }
@@ -784,6 +842,13 @@ async function replyToWhatsApp(threadId, text, tgMessageId) {
       text: '⚠️ WhatsApp ekhon connected nai, message পাঠানো gelo na.',
       message_thread_id: threadId,
     });
+  }
+
+  // "@gemini ..." likhle eta ar shadharon reply hishebe WA te jabe na - shudhu
+  // Gemini-ke jiggesh kore uttor ta WA + Telegram dutoy pathiye dei
+  const geminiPrompt = extractGeminiPrompt(text);
+  if (geminiPrompt) {
+    return handleGeminiMention(geminiPrompt, jid, threadId);
   }
   try {
     const res = await sock.sendMessage(jid, { text });
