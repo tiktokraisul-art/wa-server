@@ -276,10 +276,11 @@ async function askRnAI(parts) {
   return text;
 }
 
-// text e "@rn ..." thakle prompt ta ber kore dey (khali hole ''), na thakle null
+// text e "@rn ..." ba "@raisul network ..." thakle prompt ta ber kore dey
+// (khali hole ''), na thakle null
 function extractRnPrompt(text) {
   if (!text) return null;
-  const m = /@rn\b[:\s]*([\s\S]*)/i.exec(text);
+  const m = /@(?:rn|raisul\s*network)\b[:\s]*([\s\S]*)/i.exec(text);
   return m ? m[1].trim() : null;
 }
 
@@ -492,6 +493,15 @@ async function forwardToTelegram(m) {
     if (res?.ok) {
       boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: true, caption });
       boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
+    }
+
+    // Chobir caption e "@rn" thakle, oi chobi tai RN AI ke diye bishleshon koriye dei
+    if (type === 'imageMessage') {
+      const rnPrompt = extractRnPrompt(info.caption || '');
+      if (rnPrompt !== null) {
+        const mediaPart = { inline_data: { mime_type: info.mimetype || 'image/jpeg', data: buffer.toString('base64') } };
+        handleRnMention(rnPrompt, jid, threadId, mediaPart).catch((e) => console.log('rn mention (image) error:', e.message));
+      }
     }
   } catch (e) {
     console.log('Media forward error:', e.message);
