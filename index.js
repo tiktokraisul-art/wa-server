@@ -49,6 +49,7 @@ function boundedSet(map, key, value) {
 const waIdToTg = new Map();   // `${jid}:${waMsgId}` -> { chatId, messageId, isCaption }
 const tgMsgToWa = new Map();  // `${chatId}:${messageId}` -> { jid, key }
 const outgoingWaToTg = new Map(); // `${jid}:${waMsgId}` -> { chatId, messageId } - amader pathano reply er status (sent/delivered/seen) dekhate
+const lastWelcomed = new Map();   // jid -> 'YYYY-MM-DD' (Asia/Dhaka) - shesh kobe welcome message pathano hoyeche
 const topicLocks = new Map();   // jid -> in-flight creation promise
 const groupNameCache = new Map();
 let forumDisabled = false;      // group e Topics chalu na thakle true hoye jabe
@@ -284,6 +285,30 @@ function extractRnPrompt(text) {
   return m ? m[1].trim() : null;
 }
 
+// Shudhu English letter/digit ke "monospace" unicode e bodlay - Bangla script e
+// emon kono stylish version Unicode e nei, tai Bangla ongsho shadharon i thake
+function monoChar(code) {
+  if (code >= 65 && code <= 90) return String.fromCodePoint(code - 65 + 0x1d670); // A-Z
+  if (code >= 97 && code <= 122) return String.fromCodePoint(code - 97 + 0x1d68a); // a-z
+  if (code >= 48 && code <= 57) return String.fromCodePoint(code - 48 + 0x1d7f6); // 0-9
+  return String.fromCodePoint(code);
+}
+// Link/URL gulo bade baki shob English text ke stylish font e bodlay, jate link
+// click-joggo ar shoja thake (link bhangbe na)
+function styleAnswer(text) {
+  const urlRe = /(https?:\/\/\S+|www\.\S+)/gi;
+  let result = '';
+  let lastIndex = 0;
+  let match;
+  while ((match = urlRe.exec(text)) !== null) {
+    result += [...text.slice(lastIndex, match.index)].map((ch) => monoChar(ch.codePointAt(0))).join('');
+    result += match[0]; // URL ta jemon ache temon i thakbe
+    lastIndex = match.index + match[0].length;
+  }
+  result += [...text.slice(lastIndex)].map((ch) => monoChar(ch.codePointAt(0))).join('');
+  return result;
+}
+
 // RN AI-ke jiggesh kore WhatsApp (shei jid e) ar Telegram (shei topic e) dutoy uttor pathay.
 // mediaPart dile (chobi/audio) multimodal hishebe pathano hoy.
 async function handleRnMention(prompt, jid, threadId, mediaPart) {
@@ -291,28 +316,67 @@ async function handleRnMention(prompt, jid, threadId, mediaPart) {
   if (!textPrompt && !mediaPart) return; // kichu jiggesh kora hoyni
   const parts = mediaPart ? [mediaPart, { text: textPrompt }] : [{ text: textPrompt }];
 
+  // Gemini theke uttor ashar age porjonto "typing..." dekhiye jai, na hole
+  // WhatsApp e mone hoy kichu hocche na
+  let typingTimer = null;
+  if (status === 'connected') {
+    sock.sendPresenceUpdate('composing', jid).catch(() => {});
+    typingTimer = setInterval(() => {
+      sock.sendPresenceUpdate('composing', jid).catch(() => {});
+    }, 8000);
+  }
+
   let answer;
   try {
     answer = await askRnAI(parts);
   } catch (e) {
     console.log('askRnAI error:', e.message);
+    if (typingTimer) clearInterval(typingTimer);
+    if (status === 'connected') sock.sendPresenceUpdate('paused', jid).catch(() => {});
     const errText = '⚠️ RN AI theke uttor pawa jay nai: ' + e.message;
     if (status === 'connected') sock.sendMessage(jid, { text: errText }).catch(() => {});
     tg('sendMessage', { text: errText, message_thread_id: threadId });
     return;
   }
+  if (typingTimer) clearInterval(typingTimer);
+
+  const styled = styleAnswer(answer);
 
   if (status === 'connected') {
     try {
-      const res = await sock.sendMessage(jid, { text: '🤖 ' + answer });
+      const res = await sock.sendMessage(jid, { text: '🤖 ' + styled });
       if (res?.key?.id) {
         boundedSet(outgoingWaToTg, `${jid}:${res.key.id}`, { chatId: TG_CHAT, messageId: null });
       }
     } catch (e) {
       console.log('rn ai WA send error:', e.message);
+    } finally {
+      sock.sendPresenceUpdate('paused', jid).catch(() => {});
     }
   }
-  tg('sendMessage', { text: `🤖 RN AI:\n${answer}`, message_thread_id: threadId });
+  tg('sendMessage', { text: `🤖 RN AI:\n${styled}`, message_thread_id: threadId });
+}
+
+// Notun contact, ba notun din e ei contact er prothom message ele, ekbar
+// bujhiye dei je @rn likhle AI uttor debe, shadharon likhle amar (owner) kache jabe.
+// Note: keu nijer phone theke nijer chat history muche phelle seta amra kokhono
+// jante parbo na - eta WhatsApp amader janay na.
+function todayInDhaka() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Dhaka' }); // 'YYYY-MM-DD'
+}
+async function maybeSendWelcome(jid) {
+  if (jid.endsWith('@g.us') || jid === 'status@broadcast') return; // group/status e dorkar nai
+  const today = todayInDhaka();
+  if (lastWelcomed.get(jid) === today) return; // aajke already pathano hoyeche
+  lastWelcomed.set(jid, today); // age set kori, race condition e duibar na jay
+  await sock.sendMessage(jid, {
+    text:
+      '👋 Hi!\n\n' +
+      '🤖 AI-r sathe kotha bolte chaile @rn likhe shuru koro\n' +
+      '(jemon: @rn ajke abohawa kemon?)\n\n' +
+      'Shadharon vabe likhle seta sorasori amar (owner) kache jabe. ' +
+      'AI-r sathe kotha bolte bolte jekono shomoy shadharon message likhlei amar sathe kotha bolte parbe.',
+  });
 }
 
 // ================= Online/Last seen tracking =================
@@ -442,6 +506,12 @@ async function forwardToTelegram(m) {
   const threadField = threadId ? { message_thread_id: threadId } : {};
   subscribePresence(jid).catch(() => {});
   const sayIn = (text) => tg('sendMessage', { text: String(text).slice(0, 4096), ...threadField });
+
+  // Notun contact er prothom message, ba agerdin er por ei contact theke prothom
+  // message ashle, ekta choto welcome pathiye dei - @rn use korar niyom bujhiye
+  if (!m.key.fromMe && status === 'connected') {
+    maybeSendWelcome(jid).catch((e) => console.log('welcome send error:', e.message));
+  }
 
   const mapKey = `${jid}:${m.key.id}`;
 
