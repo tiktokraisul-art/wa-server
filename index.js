@@ -50,6 +50,7 @@ const waIdToTg = new Map();   // `${jid}:${waMsgId}` -> { chatId, messageId, isC
 const tgMsgToWa = new Map();  // `${chatId}:${messageId}` -> { jid, key }
 const outgoingWaToTg = new Map(); // `${jid}:${waMsgId}` -> { chatId, messageId } - amader pathano reply er status (sent/delivered/seen) dekhate
 const lastWelcomed = new Map();   // jid -> 'YYYY-MM-DD' (Asia/Dhaka) - shesh kobe welcome message pathano hoyeche
+const botSentWaIds = new Map();   // `${jid}:${waMsgId}` -> true - RN AI-r pathano WA message, Telegram e abar forward na hok tai
 const topicLocks = new Map();   // jid -> in-flight creation promise
 const groupNameCache = new Map();
 let forumDisabled = false;      // group e Topics chalu na thakle true hoye jabe
@@ -259,7 +260,7 @@ const RN_SYSTEM_INSTRUCTION =
   'RN AI porichoy e fire eso. Bangla ba English - jei bhashay prashno ashbe, shei ' +
   'bhashatei shadharon, bondhushulov vabe uttor dao.';
 
-async function askRnAI(parts) {
+async function askRnAIOnce(parts) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY set kora nai');
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
   const r = await fetch(url, {
@@ -271,10 +272,34 @@ async function askRnAI(parts) {
     }),
   });
   const j = await r.json();
-  if (!r.ok) throw new Error(j.error?.message || ('RN AI API error ' + r.status));
+  if (!r.ok) {
+    const err = new Error(j.error?.message || ('RN AI API error ' + r.status));
+    err.status = r.status;
+    throw err;
+  }
   const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
   if (!text) throw new Error('RN AI theke khali uttor eshece');
   return text;
+}
+
+// Gemini majhe majhe "high demand / overloaded" (503-er moto) error dey, ja
+// shadharonoto ekta chotto wait er pore nijei thik hoye jay - tai 2 bar porjonto
+// abar chesta kori tarpor hal chere dei
+async function askRnAI(parts) {
+  const delays = [0, 3000, 8000];
+  let lastErr;
+  for (let i = 0; i < delays.length; i++) {
+    if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
+    try {
+      return await askRnAIOnce(parts);
+    } catch (e) {
+      lastErr = e;
+      const transient = e.status === 503 || e.status === 429 || /overload|high demand|unavailable/i.test(e.message);
+      if (!transient) throw e;
+      console.log(`askRnAI retry ${i + 1}/${delays.length - 1} after:`, e.message);
+    }
+  }
+  throw lastErr;
 }
 
 // text e "@rn ..." ba "@raisul network ..." thakle prompt ta ber kore dey
@@ -346,7 +371,7 @@ async function handleRnMention(prompt, jid, threadId, mediaPart) {
     try {
       const res = await sock.sendMessage(jid, { text: '🤖 ' + styled });
       if (res?.key?.id) {
-        boundedSet(outgoingWaToTg, `${jid}:${res.key.id}`, { chatId: TG_CHAT, messageId: null });
+        boundedSet(botSentWaIds, `${jid}:${res.key.id}`, true);
       }
     } catch (e) {
       console.log('rn ai WA send error:', e.message);
@@ -477,9 +502,10 @@ async function forwardToTelegram(m) {
   }
 
   if (m.key.fromMe) {
-    // Amra nijera (bot diye, Telegram theke reply kore) ei message pathiyechi kina check kori -
-    // na hole Telegram e nijer lekha message abar duplicate hoye ashbe
-    if (outgoingWaToTg.has(`${jid}:${m.key.id}`)) return;
+    // Amra nijera (bot diye, Telegram theke reply kore, ba RN AI diye) ei message
+    // pathiyechi kina check kori - na hole Telegram e abar duplicate hoye ashbe
+    const k = `${jid}:${m.key.id}`;
+    if (outgoingWaToTg.has(k) || botSentWaIds.has(k)) return;
   }
 
   const content = normalizeMessageContent(m.message);
@@ -699,6 +725,7 @@ async function startWA(pairNumber) {
     auth: state,
     logger,
     browser: ['WA Server', 'Chrome', '1.0.0'],
+    markOnlineOnConnect: false, // Baileys default e connect howar shathe shathei "online" bole dey - eta bondho rakhlam
   });
   sock = s;
 
