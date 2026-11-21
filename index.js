@@ -17,10 +17,6 @@ const API_KEY = process.env.API_KEY || '';
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_CHAT = String(process.env.TELEGRAM_CHAT_ID || '');
 const INCLUDE_STATUS = process.env.INCLUDE_STATUS === 'true';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-// Model er naam Google maje majei bodlay; kaj na korle aistudio.google.com e
-// giye current free model er naam dekhe GEMINI_MODEL env e boshao.
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -49,8 +45,6 @@ function boundedSet(map, key, value) {
 const waIdToTg = new Map();   // `${jid}:${waMsgId}` -> { chatId, messageId, isCaption }
 const tgMsgToWa = new Map();  // `${chatId}:${messageId}` -> { jid, key }
 const outgoingWaToTg = new Map(); // `${jid}:${waMsgId}` -> { chatId, messageId } - amader pathano reply er status (sent/delivered/seen) dekhate
-const lastWelcomed = new Map();   // jid -> 'YYYY-MM-DD' (Asia/Dhaka) - shesh kobe welcome message pathano hoyeche
-const botSentWaIds = new Map();   // `${jid}:${waMsgId}` -> true - RN AI-r pathano WA message, Telegram e abar forward na hok tai
 const topicLocks = new Map();   // jid -> in-flight creation promise
 const groupNameCache = new Map();
 let forumDisabled = false;      // group e Topics chalu na thakle true hoye jabe
@@ -249,161 +243,6 @@ async function getChatName(jid, pushName) {
   return pushName || `+${jid.split('@')[0]}`;
 }
 
-// ================= RN AI (@rn mention, Gemini-chalito) =================
-// RN AI shadharonoto nijeke ei naam e e porichoy dibe, Gemini/Google er naam
-// nijer theke bolbe na. Tobe keu sotti-i soja jiggesh korle mittha bolbe na.
-const RN_SYSTEM_INSTRUCTION =
-  'Tomar naam "Raisul Network AI" (songkhipto rupe RN AI). Shadharonoto nijeke ' +
-  'ei naam e i porichoy dao; Google ba Gemini er kotha nijer theke kokhono bolo na. ' +
-  'Tobe keu jodi sotti-i soja jiggesh kore "tumi ki Gemini?" ba "tumi ki Google er toiri?" ' +
-  'tahole mittha bolba na - shottota shikar koro j tumi Gemini-bhittik, tarpor abar ' +
-  'RN AI porichoy e fire eso. Bangla ba English - jei bhashay prashno ashbe, shei ' +
-  'bhashatei shadharon, bondhushulov vabe uttor dao.';
-
-async function askRnAIOnce(parts) {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY set kora nai');
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: RN_SYSTEM_INSTRUCTION }] },
-      contents: [{ parts }],
-    }),
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    const err = new Error(j.error?.message || ('RN AI API error ' + r.status));
-    err.status = r.status;
-    throw err;
-  }
-  const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
-  if (!text) throw new Error('RN AI theke khali uttor eshece');
-  return text;
-}
-
-// Gemini majhe majhe "high demand / overloaded" (503-er moto) error dey, ja
-// shadharonoto ekta chotto wait er pore nijei thik hoye jay - tai 2 bar porjonto
-// abar chesta kori tarpor hal chere dei
-async function askRnAI(parts) {
-  const delays = [0, 3000, 8000];
-  let lastErr;
-  for (let i = 0; i < delays.length; i++) {
-    if (delays[i]) await new Promise((r) => setTimeout(r, delays[i]));
-    try {
-      return await askRnAIOnce(parts);
-    } catch (e) {
-      lastErr = e;
-      const transient = e.status === 503 || e.status === 429 || /overload|high demand|unavailable/i.test(e.message);
-      if (!transient) throw e;
-      console.log(`askRnAI retry ${i + 1}/${delays.length - 1} after:`, e.message);
-    }
-  }
-  throw lastErr;
-}
-
-// text e "@rn ..." ba "@raisul network ..." thakle prompt ta ber kore dey
-// (khali hole ''), na thakle null
-function extractRnPrompt(text) {
-  if (!text) return null;
-  const m = /@(?:rn|raisul\s*network)\b[:\s]*([\s\S]*)/i.exec(text);
-  return m ? m[1].trim() : null;
-}
-
-// Shudhu English letter/digit ke "monospace" unicode e bodlay - Bangla script e
-// emon kono stylish version Unicode e nei, tai Bangla ongsho shadharon i thake
-function monoChar(code) {
-  if (code >= 65 && code <= 90) return String.fromCodePoint(code - 65 + 0x1d670); // A-Z
-  if (code >= 97 && code <= 122) return String.fromCodePoint(code - 97 + 0x1d68a); // a-z
-  if (code >= 48 && code <= 57) return String.fromCodePoint(code - 48 + 0x1d7f6); // 0-9
-  return String.fromCodePoint(code);
-}
-// Link/URL gulo bade baki shob English text ke stylish font e bodlay, jate link
-// click-joggo ar shoja thake (link bhangbe na)
-function styleAnswer(text) {
-  const urlRe = /(https?:\/\/\S+|www\.\S+)/gi;
-  let result = '';
-  let lastIndex = 0;
-  let match;
-  while ((match = urlRe.exec(text)) !== null) {
-    result += [...text.slice(lastIndex, match.index)].map((ch) => monoChar(ch.codePointAt(0))).join('');
-    result += match[0]; // URL ta jemon ache temon i thakbe
-    lastIndex = match.index + match[0].length;
-  }
-  result += [...text.slice(lastIndex)].map((ch) => monoChar(ch.codePointAt(0))).join('');
-  return result;
-}
-
-// RN AI-ke jiggesh kore WhatsApp (shei jid e) ar Telegram (shei topic e) dutoy uttor pathay.
-// mediaPart dile (chobi/audio) multimodal hishebe pathano hoy.
-async function handleRnMention(prompt, jid, threadId, mediaPart) {
-  const textPrompt = prompt || (mediaPart ? 'Ei file ta bishleshon koro, ki ache eita bolo.' : '');
-  if (!textPrompt && !mediaPart) return; // kichu jiggesh kora hoyni
-  const parts = mediaPart ? [mediaPart, { text: textPrompt }] : [{ text: textPrompt }];
-
-  // Gemini theke uttor ashar age porjonto "typing..." dekhiye jai, na hole
-  // WhatsApp e mone hoy kichu hocche na
-  let typingTimer = null;
-  if (status === 'connected') {
-    sock.sendPresenceUpdate('composing', jid).catch(() => {});
-    typingTimer = setInterval(() => {
-      sock.sendPresenceUpdate('composing', jid).catch(() => {});
-    }, 8000);
-  }
-
-  let answer;
-  try {
-    answer = await askRnAI(parts);
-  } catch (e) {
-    console.log('askRnAI error:', e.message);
-    if (typingTimer) clearInterval(typingTimer);
-    if (status === 'connected') sock.sendPresenceUpdate('paused', jid).catch(() => {});
-    const errText = '⚠️ RN AI theke uttor pawa jay nai: ' + e.message;
-    if (status === 'connected') sock.sendMessage(jid, { text: errText }).catch(() => {});
-    tg('sendMessage', { text: errText, message_thread_id: threadId });
-    return;
-  }
-  if (typingTimer) clearInterval(typingTimer);
-
-  const styled = styleAnswer(answer);
-
-  if (status === 'connected') {
-    try {
-      const res = await sock.sendMessage(jid, { text: '🤖 ' + styled });
-      if (res?.key?.id) {
-        boundedSet(botSentWaIds, `${jid}:${res.key.id}`, true);
-      }
-    } catch (e) {
-      console.log('rn ai WA send error:', e.message);
-    } finally {
-      sock.sendPresenceUpdate('paused', jid).catch(() => {});
-    }
-  }
-  tg('sendMessage', { text: `🤖 RN AI:\n${styled}`, message_thread_id: threadId });
-}
-
-// Notun contact, ba notun din e ei contact er prothom message ele, ekbar
-// bujhiye dei je @rn likhle AI uttor debe, shadharon likhle amar (owner) kache jabe.
-// Note: keu nijer phone theke nijer chat history muche phelle seta amra kokhono
-// jante parbo na - eta WhatsApp amader janay na.
-function todayInDhaka() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Dhaka' }); // 'YYYY-MM-DD'
-}
-async function maybeSendWelcome(jid) {
-  if (jid.endsWith('@g.us') || jid === 'status@broadcast') return; // group/status e dorkar nai
-  const today = todayInDhaka();
-  if (lastWelcomed.get(jid) === today) return; // aajke already pathano hoyeche
-  lastWelcomed.set(jid, today); // age set kori, race condition e duibar na jay
-  await sock.sendMessage(jid, {
-    text:
-      '👋 Hi!\n\n' +
-      '🤖 AI-r sathe kotha bolte chaile @rn likhe shuru koro\n' +
-      '(jemon: @rn ajke abohawa kemon?)\n\n' +
-      'Shadharon vabe likhle seta sorasori amar (owner) kache jabe. ' +
-      'AI-r sathe kotha bolte bolte jekono shomoy shadharon message likhlei amar sathe kotha bolte parbe.',
-  });
-}
-
 // ================= Online/Last seen tracking =================
 const subscribedPresence = new Set(); // jid - already subscribe kora hoyeche
 const lastPresence = new Map();       // jid -> 'available' | 'unavailable' (last pathano state)
@@ -502,10 +341,9 @@ async function forwardToTelegram(m) {
   }
 
   if (m.key.fromMe) {
-    // Amra nijera (bot diye, Telegram theke reply kore, ba RN AI diye) ei message
-    // pathiyechi kina check kori - na hole Telegram e abar duplicate hoye ashbe
-    const k = `${jid}:${m.key.id}`;
-    if (outgoingWaToTg.has(k) || botSentWaIds.has(k)) return;
+    // Amra nijera (bot diye, Telegram theke reply kore) ei message pathiyechi kina check kori -
+    // na hole Telegram e nijer lekha message abar duplicate hoye ashbe
+    if (outgoingWaToTg.has(`${jid}:${m.key.id}`)) return;
   }
 
   const content = normalizeMessageContent(m.message);
@@ -533,11 +371,7 @@ async function forwardToTelegram(m) {
   subscribePresence(jid).catch(() => {});
   const sayIn = (text) => tg('sendMessage', { text: String(text).slice(0, 4096), ...threadField });
 
-  // Notun contact er prothom message, ba agerdin er por ei contact theke prothom
-  // message ashle, ekta choto welcome pathiye dei - @rn use korar niyom bujhiye
-  if (!m.key.fromMe && status === 'connected') {
-    maybeSendWelcome(jid).catch((e) => console.log('welcome send error:', e.message));
-  }
+
 
   const mapKey = `${jid}:${m.key.id}`;
 
@@ -550,11 +384,6 @@ async function forwardToTelegram(m) {
     if (res?.ok) {
       boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: false, text: fullText });
       boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
-    }
-    // Ekhon je kew @rn likhle i trigger hobe (tumi phone theke, ba onno keu)
-    const rnPrompt = extractRnPrompt(text);
-    if (rnPrompt !== null) {
-      handleRnMention(rnPrompt, jid, threadId).catch((e) => console.log('rn mention error:', e.message));
     }
     return;
   }
@@ -591,14 +420,6 @@ async function forwardToTelegram(m) {
       boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
     }
 
-    // Chobir caption e "@rn" thakle, oi chobi tai RN AI ke diye bishleshon koriye dei
-    if (type === 'imageMessage') {
-      const rnPrompt = extractRnPrompt(info.caption || '');
-      if (rnPrompt !== null) {
-        const mediaPart = { inline_data: { mime_type: info.mimetype || 'image/jpeg', data: buffer.toString('base64') } };
-        handleRnMention(rnPrompt, jid, threadId, mediaPart).catch((e) => console.log('rn mention (image) error:', e.message));
-      }
-    }
   } catch (e) {
     console.log('Media forward error:', e.message);
     sayIn(`${tag}${label}: file download hoy nai (${e.message})`);
@@ -792,6 +613,8 @@ async function startWA(pairNumber) {
   });
 
   s.ev.on('messages.upsert', ({ messages, type }) => {
+    if (s !== sock) return;
+    lastEventAt = Date.now();
     if (type !== 'notify') return;
     for (const m of messages) {
       if (!m.message) continue;
@@ -804,12 +627,15 @@ async function startWA(pairNumber) {
 
   s.ev.on('presence.update', ({ id, presences }) => {
     if (s !== sock) return;
+    lastEventAt = Date.now();
     handlePresenceUpdate(id, presences).catch((e) => console.log('presence handle error:', e.message));
   });
 
   // Amra WhatsApp e ja পাঠাই, tar status (sent/delivered/seen) e update ashle
   // matching Telegram message e reaction diye dekhiye dei
   s.ev.on('messages.update', (updates) => {
+    if (s !== sock) return;
+    lastEventAt = Date.now();
     for (const u of updates) {
       const st = u.update?.status;
       if (st == null) continue;
@@ -969,12 +795,6 @@ async function replyToWhatsApp(threadId, text, tgMessageId) {
     });
   }
 
-  // "@gemini ..." likhle eta ar shadharon reply hishebe WA te jabe na - shudhu
-  // Gemini-ke jiggesh kore uttor ta WA + Telegram dutoy pathiye dei
-  const rnPrompt = extractRnPrompt(text);
-  if (rnPrompt !== null) {
-    return handleRnMention(rnPrompt, jid, threadId);
-  }
   try {
     const res = await sock.sendMessage(jid, { text });
     console.log('replyToWhatsApp: sent ok, wa message id=', res?.key?.id);
