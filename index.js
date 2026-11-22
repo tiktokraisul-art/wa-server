@@ -11,6 +11,8 @@ const {
   normalizeMessageContent,
   getContentType,
 } = require('@whiskeysockets/baileys');
+const path = require('path');
+const dashboardAuth = require('./lib/dashboardAuth');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || '';
@@ -965,6 +967,12 @@ function auth(req, res, next) {
 }
 
 app.get('/', (req, res) => res.json({ status }));
+
+// ---- Dashboard (step 1: shudhu login) ----
+app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.post('/api/login', dashboardAuth.loginHandler);
+app.post('/api/logout', dashboardAuth.logoutHandler);
+app.get('/api/me', dashboardAuth.requireAuth, (req, res) => res.json({ ok: true }));
 
 app.post('/send', auth, async (req, res) => {
   try {
