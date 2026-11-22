@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WA Dashboard</title>
+<style>
+  :root {
+    --bg: #0b141a;
+    --surface: #202c33;
+    --text: #e9edef;
+    --muted: #8696a0;
+    --accent: #00a884;
+    --danger: #f15c6d;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f0f2f5;
+      --surface: #ffffff;
+      --text: #111b21;
+      --muted: #667781;
+      --accent: #008069;
+      --danger: #d9344a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Roboto, "Segoe UI", sans-serif;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .wrap {
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .logo {
+    font-size: 48px;
+    margin-bottom: 12px;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0 0 24px;
+    font-weight: 600;
+  }
+  form, .done {
+    width: 100%;
+    max-width: 340px;
+    background: var(--surface);
+    border-radius: 12px;
+    padding: 24px;
+  }
+  input {
+    width: 100%;
+    padding: 14px;
+    border-radius: 8px;
+    border: none;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 16px;
+    margin-bottom: 14px;
+  }
+  input:focus { outline: 2px solid var(--accent); }
+  button {
+    width: 100%;
+    padding: 14px;
+    border-radius: 8px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+  }
+  button:active { opacity: 0.85; }
+  .error {
+    color: var(--danger);
+    font-size: 14px;
+    margin: -4px 0 14px;
+    min-height: 18px;
+  }
+  .done {
+    text-align: center;
+  }
+  .done p {
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .logout {
+    margin-top: 16px;
+    background: transparent;
+    border: 1px solid var(--muted);
+    color: var(--text);
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="logo">💬</div>
+    <h1>WA Dashboard</h1>
+
+    <form id="loginForm">
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
+      <div class="error" id="err"></div>
+      <button type="submit">Login</button>
+    </form>
+
+    <div class="done" id="done" style="display:none">
+      <p>✅ Login successful!<br>Full chat dashboard is coming in the next update.</p>
+      <button class="logout" id="logoutBtn">Logout</button>
+    </div>
+  </div>
+
+<script>
+  const form = document.getElementById('loginForm');
+  const errBox = document.getElementById('err');
+  const done = document.getElementById('done');
+  const logoutBtn = document.getElementById('logoutBtn');
+
+  async function checkSession() {
+    try {
+      const r = await fetch('/api/me');
+      if (r.ok) {
+        form.style.display = 'none';
+        done.style.display = 'block';
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errBox.textContent = '';
+    const password = document.getElementById('password').value;
+    try {
+      const r = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      const j = await r.json();
+      if (!r.ok) { errBox.textContent = j.error || 'Login failed'; return; }
+      form.style.display = 'none';
+      done.style.display = 'block';
+    } catch (e) {
+      errBox.textContent = 'Network error: ' + e.message;
+    }
+  });
+
+  logoutBtn.addEventListener('click', async () => {
+    await fetch('/api/logout', { method: 'POST' });
+    done.style.display = 'none';
+    form.style.display = 'block';
+    document.getElementById('password').value = '';
+  });
+
+  checkSession();
+</script>
+</body>
+</html>
