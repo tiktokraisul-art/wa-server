@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WA Dashboard</title>
+<style>
+  :root {
+    --bg: #0b141a;
+    --panel: #111b21;
+    --bubble-in: #202c33;
+    --bubble-out: #005c4b;
+    --text: #e9edef;
+    --muted: #8696a0;
+    --accent: #00a884;
+    --border: #2a3942;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f0f2f5;
+      --panel: #ffffff;
+      --bubble-in: #ffffff;
+      --bubble-out: #d9fdd3;
+      --text: #111b21;
+      --muted: #667781;
+      --accent: #008069;
+      --border: #e9edef;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%; margin: 0;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, Roboto, "Segoe UI", sans-serif;
+  }
+  body {
+    display: flex; flex-direction: column;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .topbar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .topbar h1 { font-size: 18px; margin: 0; flex: 1; }
+  .back-btn { font-size: 22px; background: none; border: none; color: var(--text); cursor: pointer; padding: 4px 8px; }
+
+  /* ---- Chat list ---- */
+  #listView { flex: 1; overflow-y: auto; }
+  .chat-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .chat-row:active { background: var(--bubble-in); }
+  .avatar {
+    width: 48px; height: 48px; border-radius: 50%;
+    background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 600; flex-shrink: 0;
+  }
+  .chat-info { flex: 1; min-width: 0; }
+  .chat-name { font-weight: 600; font-size: 15px; }
+  .chat-preview {
+    color: var(--muted); font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .chat-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .empty { text-align: center; color: var(--muted); padding: 40px 20px; }
+
+  /* ---- Chat view ---- */
+  #chatView { flex: 1; display: none; flex-direction: column; min-height: 0; }
+  #messages { flex: 1; overflow-y: auto; padding: 12px; }
+  .bubble {
+    max-width: 78%; padding: 8px 12px; border-radius: 10px;
+    margin-bottom: 6px; font-size: 14.5px; line-height: 1.4;
+    word-wrap: break-word; white-space: pre-wrap;
+  }
+  .bubble.in { background: var(--bubble-in); align-self: flex-start; border-top-left-radius: 2px; }
+  .bubble.out { background: var(--bubble-out); align-self: flex-end; border-top-left-radius: 10px; border-top-right-radius: 2px; margin-left: auto; }
+  .bubble-row { display: flex; }
+  .bubble-time { display: block; text-align: right; color: var(--muted); font-size: 10px; margin-top: 2px; }
+  .media-tag { opacity: 0.8; font-style: italic; }
+</style>
+</head>
+<body>
+
+  <div class="topbar" id="listTopbar">
+    <h1>💬 WA Dashboard</h1>
+  </div>
+  <div id="listView">
+    <div class="empty" id="listEmpty" style="display:none">কোনো চ্যাট নেই এখনো।</div>
+  </div>
+
+  <div class="topbar" id="chatTopbar" style="display:none">
+    <button class="back-btn" id="backBtn">←</button>
+    <h1 id="chatTitle">Chat</h1>
+  </div>
+  <div id="chatView">
+    <div id="messages"></div>
+  </div>
+
+<script>
+  let currentJid = null;
+  let refreshTimer = null;
+
+  async function checkAuth() {
+    const r = await fetch('/api/me');
+    if (!r.ok) { window.location.href = '/dashboard'; return false; }
+    return true;
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts);
+    return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function initials(name) {
+    return (name || '?').trim().slice(0, 1).toUpperCase();
+  }
+
+  async function loadChats() {
+    const r = await fetch('/api/chats');
+    if (!r.ok) return;
+    const chats = await r.json();
+    const listView = document.getElementById('listView');
+    const empty = document.getElementById('listEmpty');
+    listView.querySelectorAll('.chat-row').forEach((el) => el.remove());
+    if (!chats.length) { empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    for (const c of chats) {
+      const row = document.createElement('div');
+      row.className = 'chat-row';
+      row.innerHTML = `
+        <div class="avatar">${initials(c.jid?.endsWith('@g.us') ? '#' : c.jid)}</div>
+        <div class="chat-info">
+          <div class="chat-name"></div>
+          <div class="chat-preview"></div>
+        </div>
+        <div class="chat-time">${fmtTime(c.lastTime)}</div>
+      `;
+      row.querySelector('.chat-name').textContent = c.jid.split('@')[0];
+      row.querySelector('.chat-preview').textContent = (c.lastDir === 'out' ? 'তুমি: ' : '') + (c.lastText || '');
+      row.addEventListener('click', () => openChat(c.jid));
+      listView.appendChild(row);
+    }
+  }
+
+  function renderMessages(msgs) {
+    const box = document.getElementById('messages');
+    box.innerHTML = '';
+    for (const m of msgs) {
+      const row = document.createElement('div');
+      row.className = 'bubble-row';
+      const b = document.createElement('div');
+      b.className = 'bubble ' + (m.dir === 'out' ? 'out' : 'in');
+      let content = '';
+      if (m.type === 'text') {
+        content = (m.text || '').replace(/</g, '&lt;');
+      } else {
+        const icon = { image: '📷', video: '🎥', audio: '🎵', document: '📄', sticker: '🧩' }[m.type] || '📎';
+        content = `<span class="media-tag">${icon} ${m.fileName || m.type}</span>` + (m.caption ? '<br>' + m.caption.replace(/</g, '&lt;') : '');
+      }
+      b.innerHTML = content + `<span class="bubble-time">${fmtTime(m.time)}</span>`;
+      row.appendChild(b);
+      box.appendChild(row);
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function loadMessages() {
+    if (!currentJid) return;
+    const r = await fetch('/api/chats/' + encodeURIComponent(currentJid) + '/messages');
+    if (!r.ok) return;
+    renderMessages(await r.json());
+  }
+
+  function openChat(jid) {
+    currentJid = jid;
+    document.getElementById('listTopbar').style.display = 'none';
+    document.getElementById('listView').style.display = 'none';
+    document.getElementById('chatTopbar').style.display = 'flex';
+    document.getElementById('chatView').style.display = 'flex';
+    document.getElementById('chatTitle').textContent = jid.split('@')[0];
+    loadMessages();
+  }
+
+  function backToList() {
+    currentJid = null;
+    document.getElementById('listTopbar').style.display = 'flex';
+    document.getElementById('listView').style.display = 'block';
+    document.getElementById('chatTopbar').style.display = 'none';
+    document.getElementById('chatView').style.display = 'none';
+    loadChats();
+  }
+
+  document.getElementById('backBtn').addEventListener('click', backToList);
+
+  (async () => {
+    if (!(await checkAuth())) return;
+    await loadChats();
+    refreshTimer = setInterval(() => {
+      if (currentJid) loadMessages(); else loadChats();
+    }, 6000);
+  })();
+</script>
+</body>
+</html>
