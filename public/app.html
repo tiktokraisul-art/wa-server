@@ -83,9 +83,15 @@
   .bubble-row { display: flex; }
   .bubble-time { display: block; text-align: right; color: var(--muted); font-size: 10px; margin-top: 2px; }
   .media-tag { opacity: 0.8; font-style: italic; }
+  #debugBox {
+    display: none; background: #5c1a1a; color: #fff; font-size: 12px;
+    padding: 10px; white-space: pre-wrap; word-break: break-word;
+  }
 </style>
 </head>
 <body>
+
+  <div id="debugBox"></div>
 
   <div class="topbar" id="listTopbar">
     <h1>💬 WA Dashboard</h1>
@@ -103,8 +109,18 @@
   </div>
 
 <script>
+  // Je kono JS error sorasori page e dekhiye dey, console khola lagbe na
+  function showDebug(msg) {
+    const box = document.getElementById('debugBox');
+    box.style.display = 'block';
+    box.textContent = String(msg);
+  }
+  window.addEventListener('error', (e) => showDebug('JS error: ' + e.message));
+  window.addEventListener('unhandledrejection', (e) => showDebug('Promise error: ' + (e.reason?.message || e.reason)));
+
   let currentJid = null;
   let refreshTimer = null;
+  let isListRefreshing = false; // tap korar shomoy refresh hole jeno row na bhenge jay
 
   async function checkAuth() {
     const r = await fetch('/api/me');
@@ -122,9 +138,15 @@
   }
 
   async function loadChats() {
-    const r = await fetch('/api/chats');
-    if (!r.ok) return;
-    const chats = await r.json();
+    let chats;
+    try {
+      const r = await fetch('/api/chats');
+      if (!r.ok) { showDebug('/api/chats failed: ' + r.status); return; }
+      chats = await r.json();
+    } catch (e) {
+      showDebug('/api/chats network error: ' + e.message);
+      return;
+    }
     const listView = document.getElementById('listView');
     const empty = document.getElementById('listEmpty');
     listView.querySelectorAll('.chat-row').forEach((el) => el.remove());
@@ -133,6 +155,7 @@
     for (const c of chats) {
       const row = document.createElement('div');
       row.className = 'chat-row';
+      row.dataset.jid = c.jid; // event delegation er jonne - direct listener na, parent e ekta i rakhbo
       row.innerHTML = `
         <div class="avatar">${initials(c.jid?.endsWith('@g.us') ? '#' : c.jid)}</div>
         <div class="chat-info">
@@ -143,10 +166,16 @@
       `;
       row.querySelector('.chat-name').textContent = c.jid.split('@')[0];
       row.querySelector('.chat-preview').textContent = (c.lastDir === 'out' ? 'তুমি: ' : '') + (c.lastText || '');
-      row.addEventListener('click', () => openChat(c.jid));
       listView.appendChild(row);
     }
   }
+
+  // Ekta single listener listView-er upor (je kokhono mucha/bodla hoy na) - tai
+  // proti 6 second e list rebuild hole o tap kokhono harabe na
+  document.getElementById('listView').addEventListener('click', (e) => {
+    const row = e.target.closest('.chat-row');
+    if (row && row.dataset.jid) openChat(row.dataset.jid);
+  });
 
   function renderMessages(msgs) {
     const box = document.getElementById('messages');
@@ -172,9 +201,13 @@
 
   async function loadMessages() {
     if (!currentJid) return;
-    const r = await fetch('/api/chats/' + encodeURIComponent(currentJid) + '/messages');
-    if (!r.ok) return;
-    renderMessages(await r.json());
+    try {
+      const r = await fetch('/api/chats/' + encodeURIComponent(currentJid) + '/messages');
+      if (!r.ok) { showDebug('/api/chats/.../messages failed: ' + r.status); return; }
+      renderMessages(await r.json());
+    } catch (e) {
+      showDebug('loadMessages error: ' + e.message);
+    }
   }
 
   function openChat(jid) {
