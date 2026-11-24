@@ -13,6 +13,7 @@ const {
 } = require('@whiskeysockets/baileys');
 const path = require('path');
 const dashboardAuth = require('./lib/dashboardAuth');
+const history = require('./lib/history');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || '';
@@ -387,6 +388,9 @@ async function forwardToTelegram(m) {
       boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: false, text: fullText });
       boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
     }
+    history
+      .appendHistory(jid, { dir: m.key.fromMe ? 'out' : 'in', type: 'text', text, name: chatName, time: Date.now() })
+      .catch((e) => console.log('history text error:', e.message));
     return;
   }
 
@@ -421,7 +425,16 @@ async function forwardToTelegram(m) {
       boundedSet(waIdToTg, mapKey, { chatId: TG_CHAT, messageId: res.result.message_id, isCaption: true, caption });
       boundedSet(tgMsgToWa, `${TG_CHAT}:${res.result.message_id}`, { jid, key: m.key });
     }
-
+    history
+      .appendHistory(jid, {
+        dir: m.key.fromMe ? 'out' : 'in',
+        type: type.replace('Message', ''),
+        caption: info.caption || '',
+        fileName: name,
+        name: chatName,
+        time: Date.now(),
+      })
+      .catch((e) => console.log('history media error:', e.message));
   } catch (e) {
     console.log('Media forward error:', e.message);
     sayIn(`${tag}${label}: file download hoy nai (${e.message})`);
@@ -804,6 +817,9 @@ async function replyToWhatsApp(threadId, text, tgMessageId) {
       boundedSet(outgoingWaToTg, `${jid}:${res.key.id}`, { chatId: TG_CHAT, messageId: tgMessageId });
       setTgReaction(TG_CHAT, tgMessageId, '🕐').catch(() => {}); // "pathano hoyeche" - WA server theke ack asar age
     }
+    // eita forwardToTelegram er dedup e skip hoye jay (duplicate thekate), tai
+    // dashboard history te ekhane shorashori likhte hoy
+    history.appendHistory(jid, { dir: 'out', type: 'text', text, time: Date.now() }).catch(() => {});
   } catch (e) {
     console.log('reply-to-whatsapp error:', e.message);
     tg('sendMessage', { text: '⚠️ Message pathano gelo na: ' + e.message, message_thread_id: threadId });
@@ -973,6 +989,22 @@ app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 
 app.post('/api/login', dashboardAuth.loginHandler);
 app.post('/api/logout', dashboardAuth.logoutHandler);
 app.get('/api/me', dashboardAuth.requireAuth, (req, res) => res.json({ ok: true }));
+app.get('/dashboard/app', (req, res) => res.sendFile(path.join(__dirname, 'public', 'app.html')));
+
+app.get('/api/chats', dashboardAuth.requireAuth, async (req, res) => {
+  try {
+    res.json(await history.listContacts());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+app.get('/api/chats/:jid/messages', dashboardAuth.requireAuth, async (req, res) => {
+  try {
+    res.json(await history.getHistory(decodeURIComponent(req.params.jid), 200));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.post('/send', auth, async (req, res) => {
   try {
