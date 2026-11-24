@@ -126,10 +126,7 @@
   async function checkSession() {
     try {
       const r = await fetch('/api/me');
-      if (r.ok) {
-        form.style.display = 'none';
-        done.style.display = 'block';
-      }
+      if (r.ok) window.location.href = '/dashboard/app';
     } catch (e) { /* ignore */ }
   }
 
@@ -145,8 +142,7 @@
       });
       const j = await r.json();
       if (!r.ok) { errBox.textContent = j.error || 'Login failed'; return; }
-      form.style.display = 'none';
-      done.style.display = 'block';
+      window.location.href = '/dashboard/app';
     } catch (e) {
       errBox.textContent = 'Network error: ' + e.message;
     }
