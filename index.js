@@ -977,6 +977,22 @@ async function pollTelegram() {
 const app = express();
 app.use(express.json());
 
+// ---- CORS (Dashboard onno domain - jemon Netlify - theke call korar jonne) ----
+// DASHBOARD_ORIGIN env e Netlify er thikana dao (jemon https://mydashboard.netlify.app).
+// Na dile shudhu localhost theke test korar jonne allow kora thake.
+const DASHBOARD_ORIGIN = process.env.DASHBOARD_ORIGIN || '';
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (origin === DASHBOARD_ORIGIN || /^https?:\/\/localhost(:\d+)?$/.test(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 function auth(req, res, next) {
   if (!API_KEY || req.headers['x-api-key'] === API_KEY) return next();
   res.status(401).json({ error: 'unauthorized' });
